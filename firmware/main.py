@@ -1,20 +1,36 @@
 # main.py
-# "Watchdog" RF Attack Logger (with OLED Display)
+# ufwv2ktracker V3.0 - Forensic Logger with Hash Chain & GPS
+#
+# Hardware:
+# ESP32
+# I2C (21/22): MPU6050, HMC5883L
+# UART2 (16/17): NEO-6M GPS
+# SPI (18/19/23/5): SD Card
+# ADC1_CH0 (G36): MIC_AIR_PIN
+# ADC1_CH1 (G39): MIC_PIEZO_PIN
+# ADC1_CH2 (G34): RF_BROAD_PIN
+# ADC1_CH3 (G35): RF_FILTER_PIN
+# ADC1_CH4 (G32): GSR_PIN
 
 import machine
 import uos
 import time
-import mpu6050
-import micropyGPS
-import sh1106  # Added for display
-from machine import Pin, ADC, UART, SPI, SoftI2C
+import mpu6050, hmc5883l, micropyGPS, gsr_sensor
+import uhashlib, ubinascii
+from machine import Pin, SoftI2C, SPI, ADC, UART
 from sdcard import SDCard
 
 # --- Config ---
-# I2C (MPU6050, SH1106)
+# I2C (MPU6050, HMC5883L)
 I2C_SCL_PIN = 22
 I2C_SDA_PIN = 21
-OLED_ADDR = 0x3C  # [cite: 1272]
+
+# ADCs (Note: Use ADC1 pins - G32-39, G36)
+RF_BROAD_PIN = 34  # AD8318 #1 (Broadband)
+RF_FILTER_PIN = 35  # AD8318 #2 (Filtered)
+MIC_AIR_PIN = 36  # MAX4466 (Air Mic)
+MIC_PIEZO_PIN = 39  # Piezo Contact Mic
+GSR_PIN = 32  # GSR Sensor
 
 # UART (GPS)
 GPS_UART_NUM = 2
@@ -28,215 +44,167 @@ SPI_MISO_PIN = 19
 SPI_CS_PIN = 5
 SD_MOUNT_POINT = '/sd'
 
-# ADC (RF Sensor)
-RF_ADC_PIN = 34
+LOG_FILE = f"{SD_MOUNT_POINT}/forensic_log_v3.csv"
+LOG_INTERVAL_MS = 100  # Log 10x/sec
 
-# Logic
-LOG_FILE = f"{SD_MOUNT_POINT}/rf_log.csv"
-LOG_INTERVAL_MS = 250
+# AD8318 Calibration (Tune this)
 RF_SLOPE = 0.025
 RF_INTERCEPT = -95.0
 
 # --- Globals ---
-i2c = None
-mpu = None
-sd = None
-gps_uart = None
+i2c, mpu, mag, gps_uart, sd = None, None, None, None, None
+adc_rf_broad, adc_rf_filter, adc_mic_air, adc_mic_piezo, gsr_dev = None, None, None, None, None
 gps_parser = micropyGPS.MicropyGPS()
-rf_adc = None
-oled = None  # Added for display
 
 
 # --- Initialization ---
 def init_all():
-    global i2c, mpu, sd, gps_uart, rf_adc, oled
-    print("Initializing components...")
+    global i2c, mpu, mag, gps_uart, sd, gps_parser
+    global adc_rf_broad, adc_rf_filter, adc_mic_air, adc_mic_piezo, gsr_dev
+    print("Initializing components V3.0...")
 
     try:
-        # I2C
         i2c = SoftI2C(scl=Pin(I2C_SCL_PIN), sda=Pin(I2C_SDA_PIN))
-        devices = i2c.scan()
-        print(f"I2C devices found: {[hex(d) for d in devices]}")
-
-        # Init OLED (Exercise 67)
-        try:
-            oled = sh1106.SH1106_I2C(128, 64, i2c, None, OLED_ADDR, rotate=180)[cite: 1272]
-            oled.fill(0)
-            oled.text("Watchdog RF Log", 0, 0, 1)
-            oled.text("Initializing...", 0, 10, 1)
-            oled.show()
-            print("OLED (SH1106) OK.")
-        except Exception as e:
-            print(f"OLED init failed: {e}")
-            oled = None  # Continue without display if it fails
-
-        # Init MPU6050 (Exercise 65)
         mpu = mpu6050.accel(i2c)
-        print("MPU6050 (Activity) OK.")
-        if oled:
-            oled.text("MPU6050 OK", 0, 20, 1);
-            oled.show()
+        mag = hmc5883l.HMC5883L(i2c)
+        print("I2C Sensors (IMU, Mag) OK.")
 
-        # UART (GPS)
-        gps_uart = UART(GPS_UART_NUM, baudrate=9600, tx=GPS_TX_PIN, rx=GPS_RX_PIN, timeout=10)
-        print("NEO-6M (GPS) OK.")
-        if oled:
-            oled.text("GPS OK", 0, 30, 1);
-            oled.show()
+        # Init ADCs
+        adc_rf_broad = ADC(Pin(RF_BROAD_PIN));
+        adc_rf_broad.atten(ADC.ATTN_11DB)
+        adc_rf_filter = ADC(Pin(RF_FILTER_PIN));
+        adc_rf_filter.atten(ADC.ATTN_11DB)
+        adc_mic_air = ADC(Pin(MIC_AIR_PIN));
+        adc_mic_air.atten(ADC.ATTN_11DB)
+        adc_mic_piezo = ADC(Pin(MIC_PIEZO_PIN));
+        adc_mic_piezo.atten(ADC.ATTN_11DB)
+        gsr_dev = gsr_sensor.GSRSensor(GSR_PIN)
+        print("ADC Sensors (RF, Mics, GSR) OK.")
 
-        # ADC (RF Sensor)
-        rf_adc = ADC(Pin(RF_ADC_PIN))
-        rf_adc.atten(ADC.ATTN_11DB)  # Set full 0-3.6V range [cite: 960]
-        print("AD8318 (RF Power) OK.")
-        if oled:
-            oled.text("RF OK", 0, 40, 1);
-            oled.show()
+        gps_uart = UART(GPS_UART_NUM, 9600, tx=GPS_TX_PIN, rx=GPS_RX_PIN, timeout=10)
+        print("GPS OK.")
 
-        # SPI / SD (Exercise 77)
-        spi = SPI(1, sck=Pin(SPI_SCK_PIN), mosi=Pin(SPI_MOSI_PIN), miso=Pin(SPI_MISO_PIN))
+        spi = SPI(1, 10000000, sck=Pin(SPI_SCK_PIN), mosi=Pin(SPI_MOSI_PIN), miso=Pin(SPI_MISO_PIN))
         sd = SDCard(spi, Pin(SPI_CS_PIN))
-        uos.mount(sd, SD_MOUNT_POINT)[cite: 1335]
+        uos.mount(sd, SD_MOUNT_POINT)
         print(f"SD card mounted at {SD_MOUNT_POINT}")
-        if oled:
-            oled.text("SD Card OK", 0, 50, 1);
-            oled.show()
 
-        # Check for log file
+        # Check log file
         try:
             uos.stat(LOG_FILE)
-            print("Log file found.")
         except OSError:
-            print("Log file not found. Creating new one.")
             with open(LOG_FILE, 'w') as f:
-                f.write("timestamp,rf_power_dbm,lat,lon,altitude,activity\n")
+                f.write("timestamp,rf_broad,rf_filter,mic_air,mic_piezo,gsr_raw,"
+                        "ax,ay,az,gx,gy,gz,mx,my,mz,lat,lon,alt,prev_hash\n")
 
-        time.sleep(1)
         print("--- Init complete. Starting logger. ---")
         return True
 
     except Exception as e:
         print(f"Fatal init error: {e}")
-        if oled:
-            oled.fill(0);
-            oled.text("INIT FAILED", 0, 0, 1);
-            oled.show()
         return False
 
 
 # --- Helper Functions ---
-def get_activity_status():
+def get_rf_power(adc):
+    v_out = (adc.read() / 4095) * 3.3
+    dbm = (v_out / RF_SLOPE) + RF_INTERCEPT
+    return dbm
+
+
+def get_hash(data_string):
+    sha = uhashlib.sha256(data_string.encode('utf-8'))
+    return ubinascii.hexlify(sha.digest()).decode('utf-8')
+
+
+def get_last_line(filepath):
     try:
-        ax = mpu.get_values()["AcX"]
-        ay = mpu.get_values()["AcY"]
-        az = mpu.get_values()["AcZ"]
-        mag_squared = (ax ** 2) + (ay ** 2) + (az ** 2)
-
-        if mag_squared < 18000 ** 2 and mag_squared > 15000 ** 2:
-            return "Still"
-        elif mag_squared > 20000 ** 2:
-            return "Moving"
-        else:
-            return "Low Activity"
+        # This is memory-intensive. For a real CSI tool, you'd
+        # seek to the end of the file, read backwards to the last \n.
+        # This is a good-enough hack for MicroPython.
+        with open(filepath, 'r') as f:
+            lines = f.readlines()
+            if len(lines) > 1:
+                return lines[-1].strip()
+            else:
+                return None
     except Exception:
-        return "Unknown"
+        return None
 
 
-def get_rf_power():
-    try:
-        adc_val = rf_adc.read()
-        v_out = (adc_val / 4095) * 3.3
-        dbm = (v_out / RF_SLOPE) + RF_INTERCEPT
-        return dbm
-    except Exception:
-        return -100.0
-
-
-def get_gps_data():
+def update_gps():
     if gps_uart.any():
         try:
             line = gps_uart.readline()
-            if line:
-                line_str = line.decode('utf-8')
-                if line_str.startswith('$GPGGA'):
-                    gps_parser.update(line_str)
+            if line: gps_parser.update(line.decode('utf-8'))
         except Exception:
-            pass  # Ignore GPS parse errors
-
-    if gps_parser.fix_stat > 0:
-        return gps_parser.latitude, gps_parser.longitude, gps_parser.altitude
-    else:
-        return 0.0, 0.0, 0.0
+            pass
 
 
-def get_timestamp():
-    t = time.localtime()
-    return f"{t[0]}-{t[1]:02d}-{t[2]:02d}T{t[3]:02d}:{t[4]:02d}:{t[5]:02d}"
-
-
-def update_display(rf_power, lat, lon, activity):
-    if not oled:
-        return  # No display found
-
-    oled.fill(0)  # [cite: 1272]
-
-    # RF Power
-    oled.text(f"RF: {rf_power:.1f} dBm", 0, 0, 1)
-
-    # GPS Status
-    gps_status = "FIX" if lat != 0.0 else "NO FIX"
-    oled.text(f"GPS: {gps_status}", 0, 12, 1)
-    oled.text(f"Lat: {lat:.3f}", 0, 24, 1)
-
-    # Activity
-    oled.text(f"Act: {activity}", 0, 36, 1)
-
-    # SD Status
-    # Simple check: just show it's mounted.
-    oled.text("SD: LOGGING", 0, 48, 1)
-
-    oled.show()  # [cite: 1272]
+def get_timestamp_ms():
+    return time.ticks_ms()
 
 
 # --- Main Loop ---
 def run_logger():
-    if not init_all():
-        return
+    if not init_all(): return
 
     last_log_time = 0
+    last_line = get_last_line(LOG_FILE)
+    prev_hash = get_hash(last_line) if last_line else "0" * 64
+    print(f"Resuming hash chain from: {prev_hash[:10]}...")
+
+    log_buffer = []
+
     while True:
         try:
             current_time = time.ticks_ms()
-
-            # Read GPS data (it's slow, so read it continuously)
-            lat, lon, alt = get_gps_data()
+            update_gps()
 
             if time.ticks_diff(current_time, last_log_time) >= LOG_INTERVAL_MS:
                 last_log_time = current_time
 
-                # Get sensor snapshots
-                timestamp = get_timestamp()
-                rf_power = get_rf_power()
-                activity = get_activity_status()
+                # --- 1. Get Sensor Snapshots ---
+                ts = get_timestamp_ms()
+                rf_b = get_rf_power(adc_rf_broad)
+                rf_f = get_rf_power(adc_rf_filter)
+                mic_a = adc_mic_air.read()  # Raw ADC, faster
+                mic_p = adc_mic_piezo.read()  # Raw ADC
+                gsr_val = gsr_dev.read_raw()
 
-                # Format data
-                log_line = f"{timestamp},{rf_power:.2f},{lat:.6f},{lon:.6f},{alt:.1f},{activity}\n"
+                imu = mpu.get_values()
+                a_x, a_y, a_z = imu["AcX"], imu["AcY"], imu["AcZ"]
+                g_x, g_y, g_z = imu["GyX"], imu["GyY"], imu["GyZ"]
 
-                # Write to SD card
-                with open(LOG_FILE, 'a') as f:
-                    f.write(log_line)
+                mag_vals = mag.get_values()
+                m_x, m_y, m_z = mag_vals["MagX"], mag_vals["MagY"], mag_vals["MagZ"]
 
-                # Update display
-                update_display(rf_power, lat, lon, activity)
+                lat, lon, alt = 0.0, 0.0, 0.0
+                if gps_parser.fix_stat > 0:
+                    lat, lon, alt = gps_parser.latitude, gps_parser.longitude, gps_parser.altitude
 
-                # Console log
-                print(f"LOG: {rf_power:.2f} dBm, GPS:({lat:.2f},{lon:.2f}), ACT:{activity}")
+                # --- 2. Create Log Line & Hash ---
+                log_line = (f"{ts},{rf_b:.2f},{rf_f:.2f},{mic_a},{mic_p},{gsr_val},"
+                            f"{a_x},{a_y},{a_z},{g_x},{g_y},{g_z},{m_x},{m_y},{m_z},"
+                            f"{lat:.6f},{lon:.6f},{alt:.1f},{prev_hash}")
+
+                prev_hash = get_hash(log_line)  # Update hash for next loop
+                log_buffer.append(log_line + "\n")
+
+                # --- 3. Write to SD Card ---
+                if len(log_buffer) >= 20:  # Write every 2 seconds
+                    with open(LOG_FILE, 'a') as f:
+                        for line in log_buffer:
+                            f.write(line)
+                    log_buffer = []
+                    print(f"LOG: RF:{rf_f:.0f} Piezo:{mic_p} GSR:{gsr_val} GPS:{gps_parser.fix_stat}")
 
         except Exception as e:
             print(f"Main loop error: {e}")
-            if oled:
-                oled.fill(0);
-                oled.text("LOOP ERROR", 0, 0, 1);
-                oled.show()
+            if log_buffer:
+                with open(LOG_FILE, 'a') as f:
+                    for line in log_buffer:
+                        f.write(line)
             time.sleep(1)
 
 
