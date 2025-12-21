@@ -1,3 +1,4 @@
+https://ko-fi.com/utah23
 # ufwv2ktracker V3.0 (Forensic Edition)
 
 This is a wearable, multi-sensor forensic device designed to detect, log, and forensically verify microwave-based (V2K/Frey Effect) attacks.
